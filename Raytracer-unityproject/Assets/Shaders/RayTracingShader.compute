@@ -1,0 +1,490 @@
+// =============================================================================
+// RayTracingShader.compute — Path Tracer (Fixed)
+// =============================================================================
+#pragma kernel CSMain
+#pragma kernel CSFilter
+
+RWTexture2D<float4> _Accumulated;
+RWTexture2D<float4> Result;
+RWTexture2D<float4> _Filtered;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float3 _DirectionalLight;
+float4 _SkyColorHorizon;
+float4 _SkyColorZenith;
+float4 _GroundColorA;
+float4 _GroundColorB;
+float _GroundSpecular;
+uint _FrameIndex;
+int _SphereCount;
+int _SamplesPerPixel;
+int _MeshCount;
+int _TriangleCount;
+float _DenoiserStrength;
+
+static const float EPSILON = 0.003;
+static const float MAX_DIST = 1e30;
+static const int MAX_BOUNCES = 8;
+static const float PI = 3.14159265;
+
+// ---- PRNG (PCG Hash — much better than Wang) ----
+uint PCGHash(uint input)
+{
+    uint state = input * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float RandomFloat(inout uint state)
+{
+    state = PCGHash(state);
+    return state / 4294967296.0;
+}
+
+// Uniform point on unit sphere via spherical coordinates (no bias, no rejection)
+float3 RandomUnitVector(inout uint state)
+{
+    float z = RandomFloat(state) * 2.0 - 1.0;
+    float a = RandomFloat(state) * 2.0 * PI;
+    float r = sqrt(1.0 - z * z);
+    return float3(r * cos(a), r * sin(a), z);
+}
+
+float3 RandomInUnitSphere(inout uint state)
+{
+    return RandomUnitVector(state) * pow(RandomFloat(state), 1.0 / 3.0);
+}
+
+// ---- Structures ----
+struct Sphere
+{
+    float3 position;
+    float radius;
+    float3 albedo;
+    float specular;
+    float3 emission;
+    float fuzz;
+    float ior;
+    int materialType; // 0=Lambertian, 1=Metal, 2=Dielectric
+};
+
+StructuredBuffer<Sphere> _Spheres;
+
+// ---- Mesh Structures ----
+struct Triangle
+{
+    float3 v0, v1, v2;
+    float3 n0, n1, n2;
+};
+
+// NOTE: StructuredBuffer uses tight packing, must match C# StructLayout exactly
+struct MeshObject
+{
+    int triStart;       // offset 0
+    int triCount;       // offset 4
+    float3 boundsMin;   // offset 8
+    float3 boundsMax;   // offset 20
+    float3 albedo;      // offset 32
+    float specular;     // offset 44
+    float3 emission;    // offset 48
+    float fuzz;         // offset 60
+    float ior;          // offset 64
+    int materialType;   // offset 68
+    // total: 72 bytes
+};
+
+StructuredBuffer<Triangle>   _Triangles;
+StructuredBuffer<MeshObject> _MeshObjects;
+
+struct Ray { float3 origin; float3 direction; };
+
+struct RayHit
+{
+    float3 position;
+    float distance;
+    float3 normal;
+    float3 albedo;
+    float specular;
+    float3 emission;
+    float fuzz;
+    float ior;
+    int materialType;
+    bool frontFace;
+};
+
+Ray CreateRay(float3 o, float3 d) { Ray r; r.origin = o; r.direction = d; return r; }
+
+Ray CreateCameraRay(float2 uv)
+{
+    float3 o = mul(_CameraToWorld, float4(0, 0, 0, 1)).xyz;
+    float3 d = mul(_CameraInverseProjection, float4(uv, 0, 1)).xyz;
+    d = normalize(mul(_CameraToWorld, float4(d, 0)).xyz);
+    return CreateRay(o, d);
+}
+
+RayHit CreateRayHit()
+{
+    RayHit h;
+    h.position = 0; h.distance = MAX_DIST; h.normal = 0;
+    h.albedo = 0; h.specular = 0; h.emission = 0;
+    h.fuzz = 0; h.ior = 1; h.materialType = 0; h.frontFace = true;
+    return h;
+}
+
+// ---- Intersection: Sphere ----
+void IntersectSphere(Ray ray, inout RayHit best, Sphere s)
+{
+    float3 oc = ray.origin - s.position;
+    float a = dot(ray.direction, ray.direction);
+    float halfB = dot(oc, ray.direction);
+    float c = dot(oc, oc) - s.radius * s.radius;
+    float disc = halfB * halfB - a * c;
+    if (disc < 0) return;
+
+    float sqrtDisc = sqrt(disc);
+
+    // Try near root first
+    float t = (-halfB - sqrtDisc) / a;
+    if (t < EPSILON || t >= best.distance)
+    {
+        // Try far root — ONLY for dielectrics (need inside hits for refraction)
+        if (s.materialType != 2) return;
+        t = (-halfB + sqrtDisc) / a;
+        if (t < EPSILON || t >= best.distance) return;
+    }
+
+    best.distance = t;
+    best.position = ray.origin + t * ray.direction;
+    float3 outwardNormal = (best.position - s.position) / s.radius;
+
+    // Determine face: use actual dot product, not assumption
+    bool front = dot(ray.direction, outwardNormal) < 0;
+    best.frontFace = front;
+    best.normal = front ? outwardNormal : -outwardNormal;
+
+    best.albedo = s.albedo;
+    best.specular = s.specular;
+    best.emission = s.emission;
+    best.fuzz = s.fuzz;
+    best.ior = s.ior;
+    best.materialType = s.materialType;
+}
+
+// ---- Intersection: Ground as giant sphere ----
+// Using a huge sphere instead of an infinite plane fixes refraction artifacts:
+// refracted rays inside glass spheres no longer "punch through" the floor.
+static const float GROUND_RADIUS = 10000.0;
+static const float3 GROUND_CENTER = float3(0, -GROUND_RADIUS, 0);
+
+void IntersectGroundSphere(Ray ray, inout RayHit best)
+{
+    // Standard sphere intersection with the ground sphere
+    Sphere ground;
+    ground.position = GROUND_CENTER;
+    ground.radius = GROUND_RADIUS;
+    ground.albedo = float3(0.5, 0.5, 0.5); // placeholder
+    ground.specular = _GroundSpecular;
+    ground.emission = float3(0, 0, 0);
+    ground.fuzz = 0;
+    ground.ior = 1;
+    ground.materialType = 0; // Lambertian — ensures only front-face hits
+
+    float prevDist = best.distance;
+    IntersectSphere(ray, best, ground);
+
+    // If we hit the ground sphere, apply checkerboard using world xz
+    if (best.distance < prevDist)
+    {
+        float2 tileUV = floor(best.position.xz);
+        float checker = fmod(abs(tileUV.x) + abs(tileUV.y), 2.0);
+        best.albedo = lerp(_GroundColorA.rgb, _GroundColorB.rgb, checker);
+    }
+}
+
+// ---- Intersection: AABB (for mesh bounding box culling) ----
+bool IntersectAABB(Ray ray, float3 bmin, float3 bmax, float maxDist)
+{
+    float3 invDir = 1.0 / ray.direction;
+    float3 t0 = (bmin - ray.origin) * invDir;
+    float3 t1 = (bmax - ray.origin) * invDir;
+    float3 tmin = min(t0, t1);
+    float3 tmax = max(t0, t1);
+    float tNear = max(max(tmin.x, tmin.y), tmin.z);
+    float tFar  = min(min(tmax.x, tmax.y), tmax.z);
+    return tFar >= max(tNear, EPSILON) && tNear < maxDist;
+}
+
+// ---- Intersection: Triangle (Möller-Trumbore) ----
+void IntersectTriangle(Ray ray, inout RayHit best, Triangle tri, MeshObject mesh)
+{
+    float3 edge1 = tri.v1 - tri.v0;
+    float3 edge2 = tri.v2 - tri.v0;
+    float3 h = cross(ray.direction, edge2);
+    float a = dot(edge1, h);
+
+    // Parallel check (allow back-face hits for dielectrics)
+    if (abs(a) < 1e-8) return;
+
+    float f = 1.0 / a;
+    float3 s = ray.origin - tri.v0;
+    float u = f * dot(s, h);
+    if (u < 0.0 || u > 1.0) return;
+
+    float3 q = cross(s, edge1);
+    float v = f * dot(ray.direction, q);
+    if (v < 0.0 || u + v > 1.0) return;
+
+    float t = f * dot(edge2, q);
+    if (t < EPSILON || t >= best.distance) return;
+
+    // Hit! Interpolate smooth normal via barycentric coords
+    float w = 1.0 - u - v;
+    float3 smoothNormal = normalize(w * tri.n0 + u * tri.n1 + v * tri.n2);
+
+    // Front face determination
+    bool front = dot(ray.direction, smoothNormal) < 0;
+
+    best.distance  = t;
+    best.position  = ray.origin + t * ray.direction;
+    best.frontFace = front;
+    best.normal    = front ? smoothNormal : -smoothNormal;
+    best.albedo    = mesh.albedo;
+    best.specular  = mesh.specular;
+    best.emission  = mesh.emission;
+    best.fuzz      = mesh.fuzz;
+    best.ior       = mesh.ior;
+    best.materialType = mesh.materialType;
+}
+
+RayHit TraceScene(Ray ray)
+{
+    RayHit hit = CreateRayHit();
+    IntersectGroundSphere(ray, hit);
+
+    // Spheres
+    for (int i = 0; i < _SphereCount; i++)
+        IntersectSphere(ray, hit, _Spheres[i]);
+
+    // Mesh objects (with AABB culling)
+    for (int m = 0; m < _MeshCount; m++)
+    {
+        MeshObject mesh = _MeshObjects[m];
+        if (!IntersectAABB(ray, mesh.boundsMin, mesh.boundsMax, hit.distance))
+            continue;
+
+        int end = mesh.triStart + mesh.triCount;
+        for (int t = mesh.triStart; t < end; t++)
+            IntersectTriangle(ray, hit, _Triangles[t], mesh);
+    }
+
+    return hit;
+}
+
+// ---- Skybox ----
+float3 SampleSkybox(float3 dir)
+{
+    float t = 0.5 * (dir.y + 1.0);
+    float3 sky = lerp(_SkyColorHorizon.rgb, _SkyColorZenith.rgb, saturate(t));
+    float sunDot = dot(dir, _DirectionalLight);
+    sky += float3(1, 0.97, 0.9) * smoothstep(0.997, 0.9995, sunDot) * 6.0;
+    sky += float3(1, 0.65, 0.25) * pow(saturate(sunDot), 48.0) * 0.4;
+    return sky;
+}
+
+// ---- Fresnel (Schlick) ----
+float Schlick(float cosine, float ior)
+{
+    float r0 = (1.0 - ior) / (1.0 + ior);
+    r0 = r0 * r0;
+    return r0 + (1.0 - r0) * pow(1.0 - cosine, 5.0);
+}
+
+// ---- Refraction ----
+float3 CustomRefract(float3 uv, float3 n, float etai_over_etat)
+{
+    float cos_theta = min(dot(-uv, n), 1.0);
+    float3 r_perp = etai_over_etat * (uv + cos_theta * n);
+    float k = 1.0 - dot(r_perp, r_perp);
+    if (k < 0) return reflect(uv, n); // total internal reflection fallback
+    float3 r_parallel = -sqrt(k) * n;
+    return r_perp + r_parallel;
+}
+
+// ---- ACES Filmic Tone Mapping ----
+float3 ACESFilm(float3 x)
+{
+    float a = 2.51; float b = 0.03;
+    float c = 2.43; float d = 0.59; float e = 0.14;
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+// ---- Path Trace with NEE ----
+float3 PathTrace(Ray ray, inout uint rng)
+{
+    float3 throughput = float3(1, 1, 1);
+    float3 radiance = float3(0, 0, 0);
+
+    for (int bounce = 0; bounce <= MAX_BOUNCES; bounce++)
+    {
+        RayHit hit = TraceScene(ray);
+
+        if (hit.distance >= MAX_DIST)
+        {
+            radiance += throughput * SampleSkybox(ray.direction);
+            break;
+        }
+
+        radiance += throughput * hit.emission;
+
+        // ---- NEE: Direct sun sampling for diffuse/rough surfaces ----
+        if (hit.materialType == 0 || (hit.materialType == 1 && hit.fuzz > 0.05))
+        {
+            float NdotL = dot(hit.normal, _DirectionalLight);
+            if (NdotL > 0.0)
+            {
+                Ray shadowRay = CreateRay(hit.position + hit.normal * EPSILON * 2.0,
+                                          _DirectionalLight);
+                RayHit shadowHit = TraceScene(shadowRay);
+                if (shadowHit.distance >= MAX_DIST)
+                {
+                    float3 sunRadiance = float3(1.4, 1.3, 1.1) * 2.5;
+                    radiance += throughput * hit.albedo * sunRadiance * NdotL / PI;
+                }
+            }
+        }
+
+        // ---- Material Scatter ----
+        if (hit.materialType == 0) // Lambertian
+        {
+            float3 target = hit.normal + RandomUnitVector(rng);
+            // Catch degenerate scatter direction
+            if (dot(target, target) < 0.001)
+                target = hit.normal;
+            ray = CreateRay(hit.position + hit.normal * EPSILON * 2.0, normalize(target));
+            throughput *= hit.albedo;
+        }
+        else if (hit.materialType == 1) // Metal
+        {
+            float3 reflected = reflect(normalize(ray.direction), hit.normal);
+            float3 scattered = normalize(reflected + hit.fuzz * RandomInUnitSphere(rng));
+            if (dot(scattered, hit.normal) <= 0) break; // absorbed
+            ray = CreateRay(hit.position + hit.normal * EPSILON * 2.0, scattered);
+            throughput *= hit.albedo;
+        }
+        else // Dielectric (Glass)
+        {
+            float eta = hit.frontFace ? (1.0 / hit.ior) : hit.ior;
+            float3 unitDir = normalize(ray.direction);
+            float cosTheta = min(dot(-unitDir, hit.normal), 1.0);
+            float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+            float3 scattered;
+            if (eta * sinTheta > 1.0 || Schlick(cosTheta, eta) > RandomFloat(rng))
+                scattered = reflect(unitDir, hit.normal);
+            else
+                scattered = CustomRefract(unitDir, hit.normal, eta);
+
+            // Offset origin: along scattered direction's side of the surface
+            float3 offsetDir = dot(scattered, hit.normal) > 0 ? hit.normal : -hit.normal;
+            ray = CreateRay(hit.position + offsetDir * EPSILON * 2.0, scattered);
+            // Pure glass doesn't attenuate (white albedo) unless tinted
+            throughput *= hit.albedo;
+            continue; // skip Russian roulette for glass
+        }
+
+        // Russian roulette after bounce 3
+        if (bounce > 3)
+        {
+            float p = max(throughput.r, max(throughput.g, throughput.b));
+            if (RandomFloat(rng) > p) break;
+            throughput /= max(p, 0.001);
+        }
+    }
+
+    return radiance;
+}
+
+// ---- Main ----
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+
+    uint pixelIndex = id.x + id.y * width;
+    uint baseSeed = pixelIndex + _FrameIndex * width * height + 1u;
+
+    // Trace multiple samples per pixel per frame
+    float3 colorSum = float3(0, 0, 0);
+    for (int s = 0; s < _SamplesPerPixel; s++)
+    {
+        uint rng = PCGHash(baseSeed + (uint)s * 2654435761u);
+
+        float2 jitter = float2(RandomFloat(rng), RandomFloat(rng));
+        float2 uv = float2(id.xy + jitter) / float2(width, height) * 2.0 - 1.0;
+
+        Ray ray = CreateCameraRay(uv);
+        float3 color = PathTrace(ray, rng);
+        colorSum += min(color, 15.0);
+    }
+    colorSum /= (float)_SamplesPerPixel;
+
+    // Progressive accumulation
+    if (_FrameIndex == 1)
+        _Accumulated[id.xy] = float4(colorSum, 1);
+    else
+        _Accumulated[id.xy] = float4(_Accumulated[id.xy].rgb + colorSum, 1);
+
+    float3 avg = _Accumulated[id.xy].rgb / _FrameIndex;
+    avg = ACESFilm(avg);
+    avg = pow(max(avg, 0.0), 1.0 / 2.2);
+
+    Result[id.xy] = float4(avg, 1.0);
+}
+
+// =============================================================================
+// Edge-Aware Bilateral Denoiser (Atrous wavelet)
+// =============================================================================
+[numthreads(8, 8, 1)]
+void CSFilter(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+
+    float3 centerColor = Result[id.xy].rgb;
+    float3 sum = centerColor;
+    float totalWeight = 1.0;
+
+    // Adaptive: stronger filter when noisy (low frame count)
+    float colorSigma = _DenoiserStrength;
+
+    // 5x5 Atrous kernel offsets (sparse sampling for wider reach)
+    static const int2 offsets[12] = {
+        int2(-2, 0), int2(2, 0), int2(0, -2), int2(0, 2),
+        int2(-1,-1), int2(1,-1), int2(-1, 1), int2(1, 1),
+        int2(-2,-2), int2(2,-2), int2(-2, 2), int2(2, 2)
+    };
+    static const float weights[12] = {
+        0.125, 0.125, 0.125, 0.125,
+        0.25,  0.25,  0.25,  0.25,
+        0.0625, 0.0625, 0.0625, 0.0625
+    };
+
+    for (int i = 0; i < 12; i++)
+    {
+        int2 p = int2(id.xy) + offsets[i];
+        if (p.x < 0 || p.y < 0 || (uint)p.x >= width || (uint)p.y >= height) continue;
+
+        float3 neighbor = Result[p].rgb;
+        float colorDist = dot(abs(neighbor - centerColor), float3(0.299, 0.587, 0.114));
+        float w = weights[i] * exp(-colorDist * colorDist / (2.0 * colorSigma * colorSigma));
+
+        sum += neighbor * w;
+        totalWeight += w;
+    }
+
+    _Filtered[id.xy] = float4(sum / totalWeight, 1.0);
+}

@@ -1,0 +1,282 @@
+// =============================================================================
+// RayTracingShader.compute — GPU Ray Tracer (Phase 1)
+// 
+// Features:
+//   - Camera ray generation from inverse projection matrices
+//   - Analytic sphere intersection
+//   - Infinite ground plane with checkerboard pattern
+//   - Blinn-Phong shading (ambient + diffuse + specular)
+//   - Hard shadows via shadow rays
+//   - Single-bounce reflections for specular surfaces
+//   - Procedural gradient skybox with sun disc & glow
+//   - Gamma correction (linear → sRGB)
+// =============================================================================
+
+#pragma kernel CSMain
+
+// ---------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------
+RWTexture2D<float4> Result;
+
+// ---------------------------------------------------------------------------
+// Camera (set from C# via Camera matrices)
+// ---------------------------------------------------------------------------
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+// ---------------------------------------------------------------------------
+// Lighting
+// ---------------------------------------------------------------------------
+float3 _DirectionalLight;   // normalized direction TO the light source
+
+// ---------------------------------------------------------------------------
+// Sky
+// ---------------------------------------------------------------------------
+float4 _SkyColorHorizon;    // warm color at horizon
+float4 _SkyColorZenith;     // cool color at zenith
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+static const float EPSILON  = 0.001;
+static const float MAX_DIST = 1e30;
+static const float PI       = 3.14159265;
+
+// ---------------------------------------------------------------------------
+// Structures
+// ---------------------------------------------------------------------------
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+struct RayHit
+{
+    float3 position;
+    float  distance;
+    float3 normal;
+    float3 albedo;
+    float  specular;   // 0 = fully diffuse, 1 = perfect mirror
+};
+
+// ---------------------------------------------------------------------------
+// Constructors
+// ---------------------------------------------------------------------------
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin    = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Camera origin in world space
+    float3 origin = mul(_CameraToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+
+    // Unproject screen UV → view space → world space
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0, 1.0)).xyz;
+    direction = mul(_CameraToWorld, float4(direction, 0.0)).xyz;
+    direction = normalize(direction);
+
+    return CreateRay(origin, direction);
+}
+
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = float3(0, 0, 0);
+    hit.distance = MAX_DIST;
+    hit.normal   = float3(0, 0, 0);
+    hit.albedo   = float3(0, 0, 0);
+    hit.specular = 0;
+    return hit;
+}
+
+// ---------------------------------------------------------------------------
+// Intersection: Sphere (analytic quadratic solution)
+// ---------------------------------------------------------------------------
+void IntersectSphere(Ray ray, inout RayHit bestHit,
+                     float3 center, float radius,
+                     float3 albedo, float specular)
+{
+    float3 oc = ray.origin - center;
+    float a = dot(ray.direction, ray.direction);
+    float b = 2.0 * dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - 4.0 * a * c;
+
+    if (discriminant < 0.0)
+        return;
+
+    float t = (-b - sqrt(discriminant)) / (2.0 * a);
+    if (t > EPSILON && t < bestHit.distance)
+    {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal   = normalize(bestHit.position - center);
+        bestHit.albedo   = albedo;
+        bestHit.specular = specular;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Intersection: Infinite ground plane at Y = 0
+// ---------------------------------------------------------------------------
+void IntersectGroundPlane(Ray ray, inout RayHit bestHit)
+{
+    if (abs(ray.direction.y) < EPSILON)
+        return;
+
+    float t = -ray.origin.y / ray.direction.y;
+    if (t > EPSILON && t < bestHit.distance)
+    {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal   = float3(0, 1, 0);
+
+        // Checkerboard pattern (scale = 1 unit)
+        float2 tileUV = floor(bestHit.position.xz);
+        float  checker = fmod(abs(tileUV.x) + abs(tileUV.y), 2.0);
+        bestHit.albedo   = lerp(float3(0.35, 0.35, 0.38), float3(0.75, 0.75, 0.78), checker);
+        bestHit.specular = 0.03;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scene definition (Phase 1: hardcoded spheres)
+// ---------------------------------------------------------------------------
+RayHit TraceScene(Ray ray)
+{
+    RayHit hit = CreateRayHit();
+
+    // Ground
+    IntersectGroundPlane(ray, hit);
+
+    // Central sphere — large, metallic silver
+    IntersectSphere(ray, hit,
+        float3(0, 1, 0), 1.0,
+        float3(0.82, 0.82, 0.87), 0.85);
+
+    // Left sphere — warm matte red
+    IntersectSphere(ray, hit,
+        float3(-2.5, 0.6, -0.5), 0.6,
+        float3(0.9, 0.15, 0.1), 0.08);
+
+    // Right sphere — glossy blue
+    IntersectSphere(ray, hit,
+        float3(2.0, 0.8, 0.5), 0.8,
+        float3(0.12, 0.25, 0.92), 0.55);
+
+    // Front-right — small golden
+    IntersectSphere(ray, hit,
+        float3(0.9, 0.35, 1.8), 0.35,
+        float3(0.95, 0.76, 0.18), 0.75);
+
+    // Far back — large diffuse green
+    IntersectSphere(ray, hit,
+        float3(-1.0, 0.5, -3.5), 0.5,
+        float3(0.15, 0.75, 0.3), 0.1);
+
+    return hit;
+}
+
+// ---------------------------------------------------------------------------
+// Procedural skybox with sun
+// ---------------------------------------------------------------------------
+float3 SampleSkybox(float3 direction)
+{
+    // Vertical gradient: horizon → zenith
+    float t = 0.5 * (direction.y + 1.0);
+    float3 sky = lerp(_SkyColorHorizon.rgb, _SkyColorZenith.rgb, saturate(t));
+
+    // Sun disc (hard bright circle)
+    float sunDot  = dot(direction, _DirectionalLight);
+    float sunDisc = smoothstep(0.997, 0.9995, sunDot);
+    sky += float3(1.0, 0.97, 0.9) * sunDisc * 6.0;
+
+    // Sun glow (soft halo)
+    float sunGlow = pow(saturate(sunDot), 48.0);
+    sky += float3(1.0, 0.65, 0.25) * sunGlow * 0.4;
+
+    return sky;
+}
+
+// ---------------------------------------------------------------------------
+// Shading: Blinn-Phong + shadows + hemisphere ambient
+// ---------------------------------------------------------------------------
+float3 Shade(Ray ray, RayHit hit)
+{
+    if (hit.distance >= MAX_DIST)
+        return SampleSkybox(ray.direction);
+
+    float3 N = hit.normal;
+    float3 L = _DirectionalLight;
+    float3 V = -ray.direction;
+    float3 H = normalize(L + V);
+
+    // --- Shadow ray ---
+    Ray shadowRay = CreateRay(hit.position + N * EPSILON * 2.0, L);
+    RayHit shadowHit = TraceScene(shadowRay);
+    float shadow = (shadowHit.distance < MAX_DIST) ? 0.15 : 1.0;
+
+    // --- Ambient (base + hemisphere sky contribution) ---
+    float skyFactor = 0.5 * (dot(N, float3(0, 1, 0)) + 1.0);
+    float3 ambient  = float3(0.06, 0.06, 0.09)
+                    + lerp(float3(0.04, 0.04, 0.04), _SkyColorZenith.rgb * 0.12, skyFactor);
+
+    // --- Diffuse (Lambertian) ---
+    float  NdotL   = max(dot(N, L), 0.0);
+    float3 diffuse = hit.albedo * NdotL;
+
+    // --- Specular (Blinn-Phong) ---
+    float  specPower = lerp(16.0, 512.0, hit.specular);
+    float  NdotH     = max(dot(N, H), 0.0);
+    float3 specular  = float3(1, 1, 1) * hit.specular * pow(NdotH, specPower);
+
+    return ambient + (diffuse + specular) * shadow;
+}
+
+// ---------------------------------------------------------------------------
+// Main kernel
+// ---------------------------------------------------------------------------
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // Bounds check (thread groups may exceed texture size)
+    if (id.x >= width || id.y >= height)
+        return;
+
+    // Screen UV in [-1, 1]
+    float2 uv = float2(id.xy + 0.5) / float2(width, height) * 2.0 - 1.0;
+
+    // Primary ray
+    Ray ray = CreateCameraRay(uv);
+    RayHit hit = TraceScene(ray);
+    float3 color = Shade(ray, hit);
+
+    // Single-bounce reflection for specular surfaces
+    if (hit.distance < MAX_DIST && hit.specular > 0.05)
+    {
+        float3 reflDir = reflect(ray.direction, hit.normal);
+        Ray reflRay    = CreateRay(hit.position + hit.normal * EPSILON * 2.0, reflDir);
+        RayHit reflHit = TraceScene(reflRay);
+        float3 reflCol = Shade(reflRay, reflHit);
+
+        // Blend reflection based on specular strength + Fresnel approximation
+        float fresnel = pow(1.0 - saturate(dot(-ray.direction, hit.normal)), 3.0);
+        float reflAmount = lerp(hit.specular * 0.4, 1.0, fresnel);
+        color = lerp(color, reflCol, reflAmount);
+    }
+
+    // Gamma correction (linear → sRGB)
+    color = pow(max(color, 0.0), 1.0 / 2.2);
+
+    Result[id.xy] = float4(color, 1.0);
+}
