@@ -1,51 +1,82 @@
 // =============================================================================
 // RayTracingMeshObject.cs — Mesh component for GPU Path Tracer
-// Attach to any GameObject with a MeshFilter to include it in ray tracing
+// Inherits material properties from RayTracingMaterialBase.
+// Caches child MeshFilters on enable and self-registers.
 // =============================================================================
+using System.Collections.Generic;
 using UnityEngine;
 
-[RequireComponent(typeof(MeshFilter))]
-public class RayTracingMeshObject : MonoBehaviour
+public class RayTracingMeshObject : RayTracingMaterialBase
 {
-    [Header("Material")]
-    [SerializeField] private RayTracingMaterialType materialType = RayTracingMaterialType.Lambertian;
-    [SerializeField] private Color albedo = Color.white;
-    [SerializeField, Range(0f, 1f)] private float specular = 0.1f;
+    // -- Registration ----------------------------------------------------------
 
-    [Header("Metal")]
-    [Tooltip("Roughness for metal surfaces. 0 = perfect mirror.")]
-    [SerializeField, Range(0f, 1f)] private float fuzz = 0f;
+    private static readonly HashSet<RayTracingMeshObject> _registered = new HashSet<RayTracingMeshObject>();
+    public  static IReadOnlyCollection<RayTracingMeshObject> RegisteredObjects => _registered;
 
-    [Header("Dielectric (Glass)")]
-    [Tooltip("Index of refraction. Glass ≈ 1.5, Water ≈ 1.33, Diamond ≈ 2.42")]
-    [SerializeField, Min(1f)] private float ior = 1.5f;
+    /// <summary>Raised when any mesh object is added or removed (topology change).</summary>
+    public static bool RegistrationChanged { get; set; }
 
-    [Header("Emission")]
-    [SerializeField] private Color emission = Color.black;
-    [SerializeField, Min(0f)] private float emissionIntensity = 0f;
+    // -- Cached MeshFilters (avoids GetComponentsInChildren every frame) --------
 
-    // Public accessors
-    public RayTracingMaterialType MaterialType { get => materialType; set => materialType = value; }
-    public Color Albedo                        { get => albedo; set => albedo = value; }
-    public float Specular                      { get => specular; set => specular = value; }
-    public float Fuzz                          { get => fuzz; set => fuzz = value; }
-    public float IOR                           { get => ior; set => ior = value; }
-    public Color Emission                      { get => emission; set => emission = value; }
-    public float EmissionIntensity             { get => emissionIntensity; set => emissionIntensity = value; }
+    private MeshFilter[] _cachedFilters;
+    public  MeshFilter[] CachedFilters => _cachedFilters;
+
+    // -- Transform dirty tracking ----------------------------------------------
+
+    private Matrix4x4 _lastLocalToWorld;
+
+    /// <summary>
+    /// Returns true if any child transform has moved since last check.
+    /// Resets automatically after the call.
+    /// </summary>
+    public bool CheckTransformDirty()
+    {
+        Matrix4x4 current = transform.localToWorldMatrix;
+        if (current != _lastLocalToWorld)
+        {
+            _lastLocalToWorld = current;
+            return true;
+        }
+        return false;
+    }
+
+    // -- Lifecycle -------------------------------------------------------------
+
+    private void OnEnable()
+    {
+        _cachedFilters = GetComponentsInChildren<MeshFilter>();
+        _lastLocalToWorld = transform.localToWorldMatrix;
+        _registered.Add(this);
+        RegistrationChanged = true;
+    }
+
+    private void OnDisable()
+    {
+        _registered.Remove(this);
+        RegistrationChanged = true;
+        _cachedFilters = null;
+    }
+
+    // -- Gizmos ----------------------------------------------------------------
 
     private void OnDrawGizmosSelected()
     {
-        MeshFilter mf = GetComponent<MeshFilter>();
-        if (mf == null || mf.sharedMesh == null) return;
+        MeshFilter[] mfs = GetComponentsInChildren<MeshFilter>();
+        if (mfs.Length == 0) return;
 
-        Color c = materialType == RayTracingMaterialType.Dielectric
+        Color c = MaterialType == RayTracingMaterialType.Dielectric
             ? new Color(0.8f, 0.9f, 1f, 0.15f)
-            : new Color(albedo.r, albedo.g, albedo.b, 0.2f);
-        Gizmos.color = c;
-        Gizmos.matrix = transform.localToWorldMatrix;
-        Gizmos.DrawMesh(mf.sharedMesh);
+            : new Color(Albedo.r, Albedo.g, Albedo.b, 0.2f);
 
-        Gizmos.color = Color.cyan;
-        Gizmos.DrawWireMesh(mf.sharedMesh);
+        foreach (var mf in mfs)
+        {
+            if (mf.sharedMesh == null) continue;
+            Gizmos.color = c;
+            Gizmos.matrix = mf.transform.localToWorldMatrix;
+            Gizmos.DrawMesh(mf.sharedMesh);
+
+            Gizmos.color = Color.cyan;
+            Gizmos.DrawWireMesh(mf.sharedMesh);
+        }
     }
 }

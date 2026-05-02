@@ -86,14 +86,10 @@ public class SphereGenerator : MonoBehaviour
         }
 
         Random.state = prev;
-        // Debug: verify material types
-        foreach (Transform child in transform)
-        {
-            var rto = child.GetComponent<RayTracingObject>();
-            if (rto != null)
-                Debug.Log($"[Sphere] {child.name}: mat={rto.MaterialType}, r={rto.Radius:F2}, fuzz={rto.Fuzz:F2}, ior={rto.IOR:F2}");
-        }
+
+#if UNITY_EDITOR
         Debug.Log($"[SphereGenerator] Created {transform.childCount} spheres.");
+#endif
     }
 
     [ContextMenu("Clear Scene")]

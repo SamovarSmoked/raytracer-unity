@@ -1,5 +1,6 @@
 // =============================================================================
-// RayTracingShader.compute — Path Tracer (Fixed)
+// RayTracingShader.compute — GPU Path Tracer
+// Two kernels: CSMain (path tracing + accumulation), CSFilter (bilateral denoiser)
 // =============================================================================
 #pragma kernel CSMain
 #pragma kernel CSFilter
@@ -7,6 +8,7 @@
 RWTexture2D<float4> _Accumulated;
 RWTexture2D<float4> Result;
 RWTexture2D<float4> _Filtered;
+RWTexture2D<float4> _NormalDepthMap;
 
 float4x4 _CameraToWorld;
 float4x4 _CameraInverseProjection;
@@ -20,15 +22,34 @@ uint _FrameIndex;
 int _SphereCount;
 int _SamplesPerPixel;
 int _MeshCount;
-int _TriangleCount;
 float _DenoiserStrength;
 
-static const float EPSILON = 0.003;
-static const float MAX_DIST = 1e30;
-static const int MAX_BOUNCES = 8;
-static const float PI = 3.14159265;
+// ---- Constants ----
+static const float EPSILON    = 0.003;
+static const float MAX_DIST   = 1e30;
+static const int   MAX_BOUNCES = 8;
+static const float PI         = 3.14159265;
 
-// ---- PRNG (PCG Hash — much better than Wang) ----
+// Skybox sun disc & glow tuning
+#define SUN_DISK_INNER     0.997   // start of hard sun disc edge
+#define SUN_DISK_OUTER     0.9995  // end of hard sun disc edge
+#define SUN_DISK_INTENSITY 6.0     // brightness multiplier for the disc
+#define SUN_GLOW_POWER     48.0    // falloff exponent for the soft halo
+#define SUN_GLOW_INTENSITY 0.4     // brightness multiplier for the halo
+#define SUN_GLOW_COLOR     float3(1, 0.65, 0.25)
+
+// Next Event Estimation (direct sun lighting)
+#define SUN_RADIANCE       float3(1.4, 1.3, 1.1)
+#define SUN_RADIANCE_SCALE 2.5
+
+// HDR clamp to prevent fireflies
+#define HDR_CLAMP 15.0
+
+// G-Buffer sentinel values
+#define GBUFFER_SKY_DEPTH 10000.0
+#define GBUFFER_HIT_THRESHOLD 9999.0
+
+// ---- PRNG (PCG Hash — much better distribution than Wang) ----
 uint PCGHash(uint input)
 {
     uint state = input * 747796405u + 2891336453u;
@@ -42,7 +63,7 @@ float RandomFloat(inout uint state)
     return state / 4294967296.0;
 }
 
-// Uniform point on unit sphere via spherical coordinates (no bias, no rejection)
+// Uniform point on unit sphere (no bias, no rejection sampling)
 float3 RandomUnitVector(inout uint state)
 {
     float z = RandomFloat(state) * 2.0 - 1.0;
@@ -81,21 +102,30 @@ struct Triangle
 // NOTE: StructuredBuffer uses tight packing, must match C# StructLayout exactly
 struct MeshObject
 {
-    int triStart;       // offset 0
-    int triCount;       // offset 4
-    float3 boundsMin;   // offset 8
-    float3 boundsMax;   // offset 20
-    float3 albedo;      // offset 32
-    float specular;     // offset 44
-    float3 emission;    // offset 48
-    float fuzz;         // offset 60
-    float ior;          // offset 64
-    int materialType;   // offset 68
-    // total: 72 bytes
+    float4x4 worldToLocal;
+    float4x4 localToWorldNormal;
+    int      bvhRootIndex;
+    float3   albedo;
+    float    specular;
+    float3   emission;
+    float    fuzz;
+    float    ior;
+    int      materialType;
+};
+
+struct BVHNode
+{
+    float3 boundsMin;
+    float3 boundsMax;
+    int leftChild;
+    int rightChild;
+    int triStart;
+    int triCount;
 };
 
 StructuredBuffer<Triangle>   _Triangles;
 StructuredBuffer<MeshObject> _MeshObjects;
+StructuredBuffer<BVHNode>    _BVHNodes;
 
 struct Ray { float3 origin; float3 direction; };
 
@@ -111,6 +141,14 @@ struct RayHit
     float ior;
     int materialType;
     bool frontFace;
+};
+
+/// Result from PathTrace: radiance + primary hit G-Buffer data
+struct PathTraceResult
+{
+    float3 color;
+    float3 primaryNormal;
+    float  primaryDepth;
 };
 
 Ray CreateRay(float3 o, float3 d) { Ray r; r.origin = o; r.direction = d; return r; }
@@ -179,11 +217,10 @@ static const float3 GROUND_CENTER = float3(0, -GROUND_RADIUS, 0);
 
 void IntersectGroundSphere(Ray ray, inout RayHit best)
 {
-    // Standard sphere intersection with the ground sphere
     Sphere ground;
     ground.position = GROUND_CENTER;
     ground.radius = GROUND_RADIUS;
-    ground.albedo = float3(0.5, 0.5, 0.5); // placeholder
+    ground.albedo = float3(0.5, 0.5, 0.5); // placeholder, overridden by checker
     ground.specular = _GroundSpecular;
     ground.emission = float3(0, 0, 0);
     ground.fuzz = 0;
@@ -202,7 +239,7 @@ void IntersectGroundSphere(Ray ray, inout RayHit best)
     }
 }
 
-// ---- Intersection: AABB (for mesh bounding box culling) ----
+// ---- Intersection: AABB (for BVH traversal) ----
 bool IntersectAABB(Ray ray, float3 bmin, float3 bmax, float maxDist)
 {
     float3 invDir = 1.0 / ray.direction;
@@ -242,12 +279,12 @@ void IntersectTriangle(Ray ray, inout RayHit best, Triangle tri, MeshObject mesh
     float w = 1.0 - u - v;
     float3 smoothNormal = normalize(w * tri.n0 + u * tri.n1 + v * tri.n2);
 
-    // Front face determination
+    // Front face determination (local space)
     bool front = dot(ray.direction, smoothNormal) < 0;
 
     best.distance  = t;
-    best.position  = ray.origin + t * ray.direction;
     best.frontFace = front;
+    // We store local normal here; TLAS traversal will transform it
     best.normal    = front ? smoothNormal : -smoothNormal;
     best.albedo    = mesh.albedo;
     best.specular  = mesh.specular;
@@ -266,16 +303,54 @@ RayHit TraceScene(Ray ray)
     for (int i = 0; i < _SphereCount; i++)
         IntersectSphere(ray, hit, _Spheres[i]);
 
-    // Mesh objects (with AABB culling)
+    // Mesh TLAS/BLAS Traversal
     for (int m = 0; m < _MeshCount; m++)
     {
         MeshObject mesh = _MeshObjects[m];
-        if (!IntersectAABB(ray, mesh.boundsMin, mesh.boundsMax, hit.distance))
-            continue;
 
-        int end = mesh.triStart + mesh.triCount;
-        for (int t = mesh.triStart; t < end; t++)
-            IntersectTriangle(ray, hit, _Triangles[t], mesh);
+        // Transform ray to Local Space
+        Ray localRay;
+        // mul(matrix, float4(vec, 1.0)) for points, mul(matrix, float4(vec, 0.0)) for vectors
+        // IMPORTANT: We do NOT normalize the local direction.
+        // This ensures local 't' equals world 't'.
+        localRay.origin    = mul(mesh.worldToLocal, float4(ray.origin, 1.0)).xyz;
+        localRay.direction = mul(mesh.worldToLocal, float4(ray.direction, 0.0)).xyz;
+
+        int stack[32];
+        int stackPtr = 0;
+        stack[stackPtr++] = mesh.bvhRootIndex;
+
+        while (stackPtr > 0)
+        {
+            BVHNode node = _BVHNodes[stack[--stackPtr]];
+
+            // Check AABB (in local space) against best.distance (world distance is preserved)
+            if (!IntersectAABB(localRay, node.boundsMin, node.boundsMax, hit.distance))
+                continue;
+
+            // Is Leaf?
+            if (node.triCount > 0)
+            {
+                int end = node.triStart + node.triCount;
+                for (int t = node.triStart; t < end; t++)
+                {
+                    float oldDist = hit.distance;
+                    IntersectTriangle(localRay, hit, _Triangles[t], mesh);
+
+                    // If hit was closer, transform normal & position to world space
+                    if (hit.distance < oldDist)
+                    {
+                        hit.position = ray.origin + hit.distance * ray.direction;
+                        hit.normal = normalize(mul(mesh.localToWorldNormal, float4(hit.normal, 0.0)).xyz);
+                    }
+                }
+            }
+            else // Internal Node
+            {
+                if (node.rightChild > 0) stack[stackPtr++] = node.rightChild;
+                if (node.leftChild > 0)  stack[stackPtr++] = node.leftChild;
+            }
+        }
     }
 
     return hit;
@@ -286,9 +361,11 @@ float3 SampleSkybox(float3 dir)
 {
     float t = 0.5 * (dir.y + 1.0);
     float3 sky = lerp(_SkyColorHorizon.rgb, _SkyColorZenith.rgb, saturate(t));
+
     float sunDot = dot(dir, _DirectionalLight);
-    sky += float3(1, 0.97, 0.9) * smoothstep(0.997, 0.9995, sunDot) * 6.0;
-    sky += float3(1, 0.65, 0.25) * pow(saturate(sunDot), 48.0) * 0.4;
+    sky += float3(1, 0.97, 0.9) * smoothstep(SUN_DISK_INNER, SUN_DISK_OUTER, sunDot) * SUN_DISK_INTENSITY;
+    sky += SUN_GLOW_COLOR * pow(saturate(sunDot), SUN_GLOW_POWER) * SUN_GLOW_INTENSITY;
+
     return sky;
 }
 
@@ -320,14 +397,30 @@ float3 ACESFilm(float3 x)
 }
 
 // ---- Path Trace with NEE ----
-float3 PathTrace(Ray ray, inout uint rng)
+// Returns radiance + primary hit data for the G-Buffer (avoids a separate trace).
+PathTraceResult PathTrace(Ray ray, inout uint rng)
 {
+    PathTraceResult result;
+    result.color = float3(0, 0, 0);
+    result.primaryNormal = float3(0, 0, 0);
+    result.primaryDepth  = GBUFFER_SKY_DEPTH;
+
     float3 throughput = float3(1, 1, 1);
     float3 radiance = float3(0, 0, 0);
 
     for (int bounce = 0; bounce <= MAX_BOUNCES; bounce++)
     {
         RayHit hit = TraceScene(ray);
+
+        // Record primary hit for G-Buffer (bounce 0 only)
+        if (bounce == 0)
+        {
+            if (hit.distance < GBUFFER_HIT_THRESHOLD)
+            {
+                result.primaryNormal = hit.normal;
+                result.primaryDepth  = hit.distance;
+            }
+        }
 
         if (hit.distance >= MAX_DIST)
         {
@@ -348,8 +441,8 @@ float3 PathTrace(Ray ray, inout uint rng)
                 RayHit shadowHit = TraceScene(shadowRay);
                 if (shadowHit.distance >= MAX_DIST)
                 {
-                    float3 sunRadiance = float3(1.4, 1.3, 1.1) * 2.5;
-                    radiance += throughput * hit.albedo * sunRadiance * NdotL / PI;
+                    float3 sunRad = SUN_RADIANCE * SUN_RADIANCE_SCALE;
+                    radiance += throughput * hit.albedo * sunRad * NdotL / PI;
                 }
             }
         }
@@ -402,7 +495,8 @@ float3 PathTrace(Ray ray, inout uint rng)
         }
     }
 
-    return radiance;
+    result.color = radiance;
+    return result;
 }
 
 // ---- Main ----
@@ -418,6 +512,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     // Trace multiple samples per pixel per frame
     float3 colorSum = float3(0, 0, 0);
+    float3 gbufNormal = float3(0, 0, 0);
+    float  gbufDepth  = GBUFFER_SKY_DEPTH;
+
     for (int s = 0; s < _SamplesPerPixel; s++)
     {
         uint rng = PCGHash(baseSeed + (uint)s * 2654435761u);
@@ -426,10 +523,21 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float2 uv = float2(id.xy + jitter) / float2(width, height) * 2.0 - 1.0;
 
         Ray ray = CreateCameraRay(uv);
-        float3 color = PathTrace(ray, rng);
-        colorSum += min(color, 15.0);
+
+        PathTraceResult ptr = PathTrace(ray, rng);
+        colorSum += min(ptr.color, HDR_CLAMP);
+
+        // Use the last sample's primary hit for G-Buffer (most representative jitter)
+        if (s == _SamplesPerPixel - 1)
+        {
+            gbufNormal = ptr.primaryNormal;
+            gbufDepth  = ptr.primaryDepth;
+        }
     }
     colorSum /= (float)_SamplesPerPixel;
+
+    // Write G-Buffer
+    _NormalDepthMap[id.xy] = float4(gbufNormal, gbufDepth);
 
     // Progressive accumulation
     if (_FrameIndex == 1)
@@ -445,8 +553,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 }
 
 // =============================================================================
-// Edge-Aware Bilateral Denoiser (Atrous wavelet)
+// Edge-Aware Bilateral Denoiser (using G-Buffers)
 // =============================================================================
+float _NormalSigma;
+float _DepthSigma;
+
 [numthreads(8, 8, 1)]
 void CSFilter(uint3 id : SV_DispatchThreadID)
 {
@@ -454,37 +565,54 @@ void CSFilter(uint3 id : SV_DispatchThreadID)
     Result.GetDimensions(width, height);
     if (id.x >= width || id.y >= height) return;
 
-    float3 centerColor = Result[id.xy].rgb;
-    float3 sum = centerColor;
-    float totalWeight = 1.0;
+    float3 centerRaw = Result[id.xy].rgb;
+    float4 centerND  = _NormalDepthMap[id.xy];
+    float3 centerNormal = centerND.xyz;
+    float  centerDepth  = centerND.w;
 
-    // Adaptive: stronger filter when noisy (low frame count)
-    float colorSigma = _DenoiserStrength;
-
-    // 5x5 Atrous kernel offsets (sparse sampling for wider reach)
-    static const int2 offsets[12] = {
-        int2(-2, 0), int2(2, 0), int2(0, -2), int2(0, 2),
-        int2(-1,-1), int2(1,-1), int2(-1, 1), int2(1, 1),
-        int2(-2,-2), int2(2,-2), int2(-2, 2), int2(2, 2)
-    };
-    static const float weights[12] = {
-        0.125, 0.125, 0.125, 0.125,
-        0.25,  0.25,  0.25,  0.25,
-        0.0625, 0.0625, 0.0625, 0.0625
-    };
-
-    for (int i = 0; i < 12; i++)
+    // Skip skybox
+    if (centerDepth > GBUFFER_HIT_THRESHOLD || centerDepth <= 0.0)
     {
-        int2 p = int2(id.xy) + offsets[i];
-        if (p.x < 0 || p.y < 0 || (uint)p.x >= width || (uint)p.y >= height) continue;
-
-        float3 neighbor = Result[p].rgb;
-        float colorDist = dot(abs(neighbor - centerColor), float3(0.299, 0.587, 0.114));
-        float w = weights[i] * exp(-colorDist * colorDist / (2.0 * colorSigma * colorSigma));
-
-        sum += neighbor * w;
-        totalWeight += w;
+        _Filtered[id.xy] = float4(centerRaw, 1.0);
+        return;
     }
 
-    _Filtered[id.xy] = float4(sum / totalWeight, 1.0);
+    float3 sum = 0.0;
+    float totalWeight = 0.0;
+
+    // Bilateral Kernel (5x5)
+    int radius = 2;
+    for (int y = -radius; y <= radius; y++)
+    {
+        for (int x = -radius; x <= radius; x++)
+        {
+            int2 offset = int2(x, y);
+            int2 p = clamp(int2(id.xy) + offset, 0, int2(width - 1, height - 1));
+
+            float3 neighborRaw = Result[p].rgb;
+            float4 neighborND  = _NormalDepthMap[p];
+            float3 neighborNormal = neighborND.xyz;
+            float  neighborDepth  = neighborND.w;
+
+            // Spatial Weight
+            float distSq = x * x + y * y;
+            float wSpatial = exp(-distSq / (2.0 * _DenoiserStrength * _DenoiserStrength));
+
+            // Normal Weight
+            float normalDiff = max(0.0, dot(centerNormal, neighborNormal));
+            float wNormal = pow(normalDiff, _NormalSigma);
+
+            // Depth Weight
+            float depthDiff = abs(centerDepth - neighborDepth) / (centerDepth + 0.001);
+            float wDepth = exp(-depthDiff * _DepthSigma * 10.0);
+
+            float w = wSpatial * wNormal * wDepth;
+
+            sum += neighborRaw * w;
+            totalWeight += w;
+        }
+    }
+
+    float3 finalColor = sum / max(totalWeight, 0.0001);
+    _Filtered[id.xy] = float4(finalColor, 1.0);
 }

@@ -434,10 +434,15 @@
 -analyzer:"C:/Program Files/Unity/Hub/Editor/6000.4.5f1/Editor/Data/Tools/BuildPipeline/Unity.SourceGenerators/Unity.Properties.SourceGenerator.dll"
 -analyzer:"C:/Program Files/Unity/Hub/Editor/6000.4.5f1/Editor/Data/Tools/BuildPipeline/Unity.SourceGenerators/Unity.SourceGenerators.dll"
 -analyzer:"C:/Program Files/Unity/Hub/Editor/6000.4.5f1/Editor/Data/Tools/BuildPipeline/Unity.SourceGenerators/Unity.UIToolkit.SourceGenerator.dll"
+"Assets/Scripts/BVHBuilder.cs"
 "Assets/Scripts/FreeCameraController.cs"
+"Assets/Scripts/RayTracingGPUStructs.cs"
 "Assets/Scripts/RayTracingMaster.cs"
+"Assets/Scripts/RayTracingMaterialBase.cs"
 "Assets/Scripts/RayTracingMeshObject.cs"
 "Assets/Scripts/RayTracingObject.cs"
+"Assets/Scripts/RotateMe.cs"
+"Assets/Scripts/SceneBufferManager.cs"
 "Assets/Scripts/SphereGenerator.cs"
 -langversion:9.0
 /deterministic
